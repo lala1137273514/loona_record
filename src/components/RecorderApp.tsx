@@ -7,9 +7,16 @@ import { FINISH_STEPS, ORIGINAL_TEST_TASKS } from "@/lib/guide";
 import { normalizeUsername, shouldCreateNewUid } from "@/lib/identity";
 import { getLabDisplayState, type LabStatus } from "@/lib/lab-state";
 import { getBrowserSupabase } from "@/lib/supabase/client";
+import {
+  formatWakeDetectionStatus,
+  isWakeDetected,
+  type WakeDetectionResult,
+} from "@/lib/wake-detection";
 
 const UID_KEY = "loona_record_uid";
 const USERNAME_KEY = "loona_record_username";
+const WAKE_POLL_INTERVAL_MS = 320;
+const WAKE_FLASH_MS = 2200;
 
 type LogLine = {
   id: string;
@@ -27,7 +34,7 @@ export function RecorderApp() {
   const [uid, setUid] = useState("");
   const [username, setUsername] = useState("");
   const [status, setStatus] = useState<LabStatus>("idle");
-  const [statusText, setStatusText] = useState("照左侧清单念念看 —— 按 W/Q 会上传最近 4 秒");
+  const [statusText, setStatusText] = useState("照左侧清单念念看 —— 变绿就是识别到了");
   const [done, setDone] = useState(() => ORIGINAL_TEST_TASKS.map(() => false));
   const [activeTaskIndex, setActiveTaskIndex] = useState(0);
   const [introOpen, setIntroOpen] = useState(true);
@@ -41,6 +48,11 @@ export function RecorderApp() {
   const monitorRef = useRef<LiveAudioMonitor | null>(null);
   const startedAtRef = useRef<number | null>(null);
   const flashTimerRef = useRef<number | null>(null);
+  const wakeFlashTimerRef = useRef<number | null>(null);
+  const wakePollTimerRef = useRef<number | null>(null);
+  const wakeSessionIdRef = useRef("");
+  const wakeDetectorDisabledRef = useRef(false);
+  const lastWakeAtRef = useRef(0);
 
   useEffect(() => {
     const existingUid = window.localStorage.getItem(UID_KEY);
@@ -54,6 +66,15 @@ export function RecorderApp() {
       if (flashTimerRef.current) {
         window.clearTimeout(flashTimerRef.current);
       }
+      if (wakeFlashTimerRef.current) {
+        window.clearTimeout(wakeFlashTimerRef.current);
+      }
+      stopWakePolling();
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
       if (previewUrl) {
         URL.revokeObjectURL(previewUrl);
       }
@@ -109,14 +130,101 @@ export function RecorderApp() {
       const monitor = await createLiveAudioMonitor((level) => setMicLevel(level));
       monitorRef.current = monitor;
       startedAtRef.current = Date.now();
+      wakeSessionIdRef.current = `${uid || crypto.randomUUID()}-${Date.now()}`;
+      wakeDetectorDisabledRef.current = false;
+      lastWakeAtRef.current = 0;
       setStatus("listening");
-      setStatusText("开始吧！照左侧清单念；漏识别按 Ctrl+W，误唤醒按 Ctrl+Q");
+      setStatusText("开始吧！照左侧清单念；变绿就是识别到了");
       setIntroOpen(false);
       addLog("y", "已开启麦克风，开始测试");
+      scheduleWakePolling();
     } catch (error) {
       setStatus("error");
       setStatusText(error instanceof Error ? error.message : "无法启动麦克风");
     }
+  }
+
+  function stopWakePolling() {
+    if (wakePollTimerRef.current) {
+      window.clearTimeout(wakePollTimerRef.current);
+      wakePollTimerRef.current = null;
+    }
+  }
+
+  function scheduleWakePolling(delayMs = WAKE_POLL_INTERVAL_MS) {
+    stopWakePolling();
+    wakePollTimerRef.current = window.setTimeout(() => {
+      wakePollTimerRef.current = null;
+      void pollWakeDetector();
+    }, delayMs);
+  }
+
+  async function pollWakeDetector() {
+    const monitor = monitorRef.current;
+    if (!monitor || wakeDetectorDisabledRef.current) {
+      return;
+    }
+
+    try {
+      const captured = monitor.drainForDetection();
+      const minSamples = captured.sampleRate * captured.channelCount * 0.12;
+      if (captured.samples.length >= minSamples) {
+        const pcm = downsampleFloat32ToMono16k(captured.samples, {
+          inputSampleRate: captured.sampleRate,
+          channelCount: captured.channelCount,
+        });
+        if (pcm.length >= 160) {
+          const wav = encodePcm16Wav(pcm, 16000);
+          const response = await fetch("/api/wake", {
+            method: "POST",
+            headers: {
+              "Content-Type": "audio/wav",
+              "x-loona-session-id": wakeSessionIdRef.current || "default",
+            },
+            body: toArrayBuffer(wav),
+          });
+          const result = await response.json() as WakeDetectionResult;
+
+          if (!response.ok) {
+            wakeDetectorDisabledRef.current = true;
+            const message = result.error || "实时检测服务不可用";
+            addLog(response.status === 503 ? "y" : "r", `实时检测已停用：${message}`);
+            return;
+          }
+
+          if (isWakeDetected(result)) {
+            showWakeDetected(result);
+          }
+        }
+      }
+    } catch (error) {
+      wakeDetectorDisabledRef.current = true;
+      addLog("r", `实时检测已停用：${error instanceof Error ? error.message : "请求失败"}`);
+    } finally {
+      if (monitorRef.current && !wakeDetectorDisabledRef.current) {
+        scheduleWakePolling();
+      }
+    }
+  }
+
+  function showWakeDetected(result: WakeDetectionResult) {
+    const now = Date.now();
+    if (now - lastWakeAtRef.current < WAKE_FLASH_MS) {
+      return;
+    }
+    lastWakeAtRef.current = now;
+    const detail = formatWakeDetectionStatus(result);
+    setStatus("wake_detected");
+    setStatusText(detail);
+    addLog("g", `🟢 唤醒 ${detail}`);
+
+    if (wakeFlashTimerRef.current) {
+      window.clearTimeout(wakeFlashTimerRef.current);
+    }
+    wakeFlashTimerRef.current = window.setTimeout(() => {
+      setStatus((current) => (current === "wake_detected" ? "listening" : current));
+      setStatusText("照左侧清单念念看 —— 变绿就是识别到了");
+    }, WAKE_FLASH_MS);
   }
 
   async function saveCase(label: CaseLabel) {
@@ -237,7 +345,7 @@ export function RecorderApp() {
     }
     flashTimerRef.current = window.setTimeout(() => {
       setStatus((current) => (current === "sample_saved" ? "listening" : current));
-      setStatusText("照左侧清单念念看 —— 按 W/Q 会上传最近 4 秒");
+      setStatusText("照左侧清单念念看 —— 变绿就是识别到了");
     }, 1600);
   }
 
@@ -362,6 +470,7 @@ type CapturedAudio = {
 
 type LiveAudioMonitor = {
   capture: () => CapturedAudio;
+  drainForDetection: () => CapturedAudio;
   stop: () => void;
 };
 
@@ -387,8 +496,11 @@ async function createLiveAudioMonitor(onLevel: (level: number) => void): Promise
   const channelCount = source.channelCount || 1;
   const processor = audioContext.createScriptProcessor(4096, channelCount, 1);
   const chunks: Float32Array[] = [];
+  const detectionChunks: Float32Array[] = [];
   const maxSamples = Math.ceil(audioContext.sampleRate * channelCount * 4);
+  const maxDetectionSamples = Math.ceil(audioContext.sampleRate * channelCount * 2);
   let totalSamples = 0;
+  let detectionSamples = 0;
 
   processor.onaudioprocess = (event) => {
     const input = event.inputBuffer;
@@ -404,8 +516,13 @@ async function createLiveAudioMonitor(onLevel: (level: number) => void): Promise
     }
     chunks.push(interleaved);
     totalSamples += interleaved.length;
+    detectionChunks.push(interleaved);
+    detectionSamples += interleaved.length;
     while (totalSamples > maxSamples && chunks.length > 1) {
       totalSamples -= chunks.shift()?.length ?? 0;
+    }
+    while (detectionSamples > maxDetectionSamples && detectionChunks.length > 1) {
+      detectionSamples -= detectionChunks.shift()?.length ?? 0;
     }
     onLevel(Math.min(1, Math.sqrt(energy / interleaved.length) * 8));
   };
@@ -421,6 +538,21 @@ async function createLiveAudioMonitor(onLevel: (level: number) => void): Promise
         samples.set(chunk, offset);
         offset += chunk.length;
       }
+      return {
+        samples,
+        sampleRate: audioContext.sampleRate,
+        channelCount,
+      };
+    },
+    drainForDetection() {
+      const samples = new Float32Array(detectionSamples);
+      let offset = 0;
+      for (const chunk of detectionChunks) {
+        samples.set(chunk, offset);
+        offset += chunk.length;
+      }
+      detectionChunks.length = 0;
+      detectionSamples = 0;
       return {
         samples,
         sampleRate: audioContext.sampleRate,

@@ -8,7 +8,9 @@
     "start": "next start",
     "test": "vitest",
     "test:run": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "wake:dev": "python3 -m python_wake_service.server",
+    "wake:test": "python3 -m unittest python_wake_service.test_server"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.89.0",
