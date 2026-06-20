@@ -47,7 +47,7 @@ This repo includes a Dockerized Python wake detector for Render Web Services:
 
 - `Dockerfile`: builds the original TorchKWS + verifier sidecar with CPU PyTorch.
 - `render.yaml`: Render Blueprint for a Docker web service with `/health` checks.
-- `WAKE_API_TOKEN`: optional but recommended. When set on Render, `/wake` and `/wake/reset` require the same token from Vercel.
+- `WAKE_API_TOKEN`: required for production. Set the same private token in Render and Vercel.
 
 After deploying the Render service, set these Vercel env vars and redeploy:
 

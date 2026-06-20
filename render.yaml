@@ -8,5 +8,4 @@ services:
     healthCheckPath: /health
     envVars:
       - key: WAKE_API_TOKEN
-        generateValue: true
-
+        sync: false
