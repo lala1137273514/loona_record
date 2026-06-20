@@ -598,29 +598,51 @@ function toArrayBuffer(bytes: Uint8Array) {
 
 async function requestWakeDetection(wav: Uint8Array, sessionId: string) {
   const directUrl = process.env.NEXT_PUBLIC_WAKE_API_URL?.replace(/\/$/, "");
-  const response = directUrl
-    ? await fetch(`${directUrl}/wake`, {
+  if (directUrl) {
+    try {
+      const directResponse = await fetch(`${directUrl}/wake`, {
         method: "POST",
         mode: "cors",
         headers: {
+          "bypass-tunnel-reminder": "true",
           "Content-Type": "application/json",
           "x-loona-session-id": sessionId,
         },
         body: JSON.stringify({ audio_wav_base64: bytesToBase64(wav) }),
-      })
-    : await fetch("/api/wake", {
-        method: "POST",
-        headers: {
-          "Content-Type": "audio/wav",
-          "x-loona-session-id": sessionId,
-        },
-        body: toArrayBuffer(wav),
       });
+      const directResult = await readWakeJson(directResponse);
+      return {
+        response: directResponse,
+        result: directResult,
+      };
+    } catch {
+      // localtunnel can return an HTML reminder page to browser clients.
+      // Fall back to the server-side proxy, which is slower but stable.
+    }
+  }
+
+  const response = await fetch("/api/wake", {
+    method: "POST",
+    headers: {
+      "Content-Type": "audio/wav",
+      "x-loona-session-id": sessionId,
+    },
+    body: toArrayBuffer(wav),
+  });
 
   return {
     response,
-    result: await response.json() as WakeDetectionResult,
+    result: await readWakeJson(response),
   };
+}
+
+async function readWakeJson(response: Response) {
+  const text = await response.text();
+  try {
+    return JSON.parse(text) as WakeDetectionResult;
+  } catch {
+    throw new Error(`wake detector returned non-JSON (${response.status})`);
+  }
 }
 
 function bytesToBase64(bytes: Uint8Array) {
