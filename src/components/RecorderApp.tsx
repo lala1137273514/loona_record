@@ -15,7 +15,7 @@ import {
 
 const UID_KEY = "loona_record_uid";
 const USERNAME_KEY = "loona_record_username";
-const WAKE_POLL_INTERVAL_MS = 320;
+const WAKE_POLL_INTERVAL_MS = 240;
 const WAKE_FLASH_MS = 5000;
 
 type LogLine = {
@@ -168,6 +168,7 @@ export function RecorderApp() {
     if (!monitor || wakeDetectorDisabledRef.current) {
       return;
     }
+    let sentRequest = false;
 
     try {
       const captured = monitor.drainForDetection();
@@ -179,15 +180,8 @@ export function RecorderApp() {
         });
         if (pcm.length >= 160) {
           const wav = encodePcm16Wav(pcm, 16000);
-          const response = await fetch("/api/wake", {
-            method: "POST",
-            headers: {
-              "Content-Type": "audio/wav",
-              "x-loona-session-id": wakeSessionIdRef.current || "default",
-            },
-            body: toArrayBuffer(wav),
-          });
-          const result = await response.json() as WakeDetectionResult;
+          sentRequest = true;
+          const { response, result } = await requestWakeDetection(wav, wakeSessionIdRef.current || "default");
 
           if (!response.ok) {
             wakeDetectorDisabledRef.current = true;
@@ -206,7 +200,7 @@ export function RecorderApp() {
       addLog("r", `实时检测已停用：${error instanceof Error ? error.message : "请求失败"}`);
     } finally {
       if (monitorRef.current && !wakeDetectorDisabledRef.current) {
-        scheduleWakePolling();
+        scheduleWakePolling(sentRequest ? 0 : WAKE_POLL_INTERVAL_MS);
       }
     }
   }
@@ -600,4 +594,41 @@ function toArrayBuffer(bytes: Uint8Array) {
   const output = new ArrayBuffer(bytes.byteLength);
   new Uint8Array(output).set(bytes);
   return output;
+}
+
+async function requestWakeDetection(wav: Uint8Array, sessionId: string) {
+  const directUrl = process.env.NEXT_PUBLIC_WAKE_API_URL?.replace(/\/$/, "");
+  const response = directUrl
+    ? await fetch(`${directUrl}/wake`, {
+        method: "POST",
+        mode: "cors",
+        headers: {
+          "Content-Type": "application/json",
+          "x-loona-session-id": sessionId,
+        },
+        body: JSON.stringify({ audio_wav_base64: bytesToBase64(wav) }),
+      })
+    : await fetch("/api/wake", {
+        method: "POST",
+        headers: {
+          "Content-Type": "audio/wav",
+          "x-loona-session-id": sessionId,
+        },
+        body: toArrayBuffer(wav),
+      });
+
+  return {
+    response,
+    result: await response.json() as WakeDetectionResult,
+  };
+}
+
+function bytesToBase64(bytes: Uint8Array) {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return window.btoa(binary);
 }
