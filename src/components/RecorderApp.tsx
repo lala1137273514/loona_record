@@ -17,6 +17,8 @@ const UID_KEY = "loona_record_uid";
 const USERNAME_KEY = "loona_record_username";
 const WAKE_POLL_INTERVAL_MS = 240;
 const WAKE_FLASH_MS = 5000;
+const SAMPLE_RING_SECONDS = 8;
+const DETECTION_BACKLOG_SECONDS = 8;
 
 type LogLine = {
   id: string;
@@ -519,8 +521,8 @@ async function createLiveAudioMonitor(onLevel: (level: number) => void): Promise
   const processor = audioContext.createScriptProcessor(4096, channelCount, 1);
   const chunks: Float32Array[] = [];
   const detectionChunks: Float32Array[] = [];
-  const maxSamples = Math.ceil(audioContext.sampleRate * channelCount * 4);
-  const maxDetectionSamples = Math.ceil(audioContext.sampleRate * channelCount * 2);
+  const maxSamples = Math.ceil(audioContext.sampleRate * channelCount * SAMPLE_RING_SECONDS);
+  const maxDetectionSamples = Math.ceil(audioContext.sampleRate * channelCount * DETECTION_BACKLOG_SECONDS);
   let totalSamples = 0;
   let detectionSamples = 0;
 
