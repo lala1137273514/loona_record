@@ -5,12 +5,11 @@ import { createStoragePath, type CaseLabel } from "@/lib/cases";
 import { downsampleFloat32ToMono16k, encodePcm16Wav } from "@/lib/audio/wav";
 import { FINISH_STEPS, ORIGINAL_TEST_TASKS } from "@/lib/guide";
 import { normalizeUsername, shouldCreateNewUid } from "@/lib/identity";
+import { getLabDisplayState, type LabStatus } from "@/lib/lab-state";
 import { getBrowserSupabase } from "@/lib/supabase/client";
 
 const UID_KEY = "loona_record_uid";
 const USERNAME_KEY = "loona_record_username";
-
-type LabStatus = "idle" | "listening" | "saving" | "success" | "error";
 
 type LogLine = {
   id: string;
@@ -190,7 +189,7 @@ export function RecorderApp() {
         real_pos: current.real_pos + (label === "real_pos" ? 1 : 0),
         real_neg: current.real_neg + (label === "real_neg" ? 1 : 0),
       }));
-      setStatus("success");
+      setStatus("sample_saved");
       setStatusText(label === "real_pos" ? `已存正样本 #${stats.real_pos + 1}` : `已存负样本 #${stats.real_neg + 1}`);
       addLog(label === "real_pos" ? "g" : "r", `${label === "real_pos" ? "漏识别→正样本" : "误唤醒→负样本"} (${durationMs}ms)`);
       flashSuccess();
@@ -237,14 +236,14 @@ export function RecorderApp() {
       window.clearTimeout(flashTimerRef.current);
     }
     flashTimerRef.current = window.setTimeout(() => {
-      setStatus((current) => (current === "success" ? "listening" : current));
+      setStatus((current) => (current === "sample_saved" ? "listening" : current));
       setStatusText("照左侧清单念念看 —— 按 W/Q 会上传最近 4 秒");
     }, 1600);
   }
 
   const doneCount = done.filter(Boolean).length;
   const progress = `${(doneCount / ORIGINAL_TEST_TASKS.length) * 100}%`;
-  const appClassName = status === "success" ? "lab-app green" : "lab-app";
+  const displayState = getLabDisplayState(status);
 
   return (
     <>
@@ -285,8 +284,8 @@ export function RecorderApp() {
         </button>
       </aside>
 
-      <main className={appClassName}>
-        <div className="lab-big">{status === "success" ? "🟢 已上传" : status === "error" ? "⚠️ 出错" : "🔴 待命"}</div>
+      <main className={displayState.appClassName}>
+        <div className="lab-big">{displayState.headline}</div>
         <div className="lab-meta">{statusText}</div>
         <div className="lab-micwrap">
           <div>麦克风音量(说话时应跳动；不动=浏览器没收到声音)</div>
