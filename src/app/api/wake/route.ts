@@ -37,10 +37,12 @@ export async function POST(request: NextRequest) {
     const upstream = await fetch(joinWakeUrl(baseUrl, "/wake"), {
       method: "POST",
       headers: {
-        "Content-Type": "audio/wav",
+        "Content-Type": "application/json",
         "x-loona-session-id": sessionId,
       },
-      body,
+      body: JSON.stringify({
+        audio_wav_base64: Buffer.from(body).toString("base64"),
+      }),
       cache: "no-store",
       signal: controller.signal,
     });
@@ -75,4 +77,3 @@ async function readJson(response: Response) {
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "wake detector request failed";
 }
-

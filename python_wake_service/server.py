@@ -8,6 +8,7 @@ session, so VAD boundaries and refractory timing behave like the old lab app.
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import time
@@ -60,6 +61,38 @@ def iter_frames(pcm: np.ndarray, start_index: int) -> Iterator[Frame]:
     for offset in range(n_frames):
         start = offset * FRAME_SIZE
         yield Frame(index=start_index + offset, pcm=pcm[start : start + FRAME_SIZE])
+
+
+def read_http_body(handler: BaseHTTPRequestHandler) -> bytes:
+    """Read request body from either Content-Length or chunked transfer encoding."""
+    transfer_encoding = handler.headers.get("transfer-encoding", "").lower()
+    if "chunked" in transfer_encoding:
+        chunks: list[bytes] = []
+        while True:
+            size_line = handler.rfile.readline().strip()
+            if not size_line:
+                continue
+            size = int(size_line.split(b";", 1)[0], 16)
+            if size == 0:
+                handler.rfile.readline()
+                break
+            chunks.append(handler.rfile.read(size))
+            handler.rfile.readline()
+        return b"".join(chunks)
+
+    length = int(handler.headers.get("content-length", "0"))
+    return handler.rfile.read(length)
+
+
+def extract_wav_body(body: bytes, content_type: str | None) -> bytes:
+    """Accept raw audio/wav or JSON base64-wrapped WAV for text-only tunnels."""
+    if content_type and "application/json" in content_type.lower():
+        payload = json.loads(body.decode("utf-8"))
+        encoded = payload.get("audio_wav_base64")
+        if not isinstance(encoded, str) or not encoded:
+            raise ValueError("JSON body must include audio_wav_base64")
+        return base64.b64decode(encoded)
+    return body
 
 
 class ScoredVerifier:
@@ -241,9 +274,9 @@ class WakeRequestHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            length = int(self.headers.get("content-length", "0"))
-            body = self.rfile.read(length)
-            result = self.detector.feed_wav(session_id, body)
+            body = read_http_body(self)
+            wav_body = extract_wav_body(body, self.headers.get("content-type"))
+            result = self.detector.feed_wav(session_id, wav_body)
             self._json(HTTPStatus.OK, result)
         except Exception as exc:  # noqa: BLE001 - keep service alive and report the real issue
             self._json(HTTPStatus.BAD_REQUEST, {"wake": False, "error": str(exc)})
@@ -291,4 +324,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
