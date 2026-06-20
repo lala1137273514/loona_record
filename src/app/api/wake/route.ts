@@ -34,13 +34,11 @@ export async function POST(request: NextRequest) {
   const timeout = setTimeout(() => controller.abort(), WAKE_API_TIMEOUT_MS);
 
   try {
-    const wakeApiToken = process.env.WAKE_API_TOKEN;
     const upstream = await fetch(joinWakeUrl(baseUrl, "/wake"), {
       method: "POST",
       headers: {
         "Content-Type": "audio/wav",
         "x-loona-session-id": sessionId,
-        ...(wakeApiToken ? { "x-loona-wake-token": wakeApiToken } : {}),
       },
       body,
       cache: "no-store",
@@ -77,3 +75,4 @@ async function readJson(response: Response) {
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "wake detector request failed";
 }
+

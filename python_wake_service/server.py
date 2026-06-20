@@ -8,10 +8,8 @@ session, so VAD boundaries and refractory timing behave like the old lab app.
 from __future__ import annotations
 
 import argparse
-import hmac
 import io
 import json
-import os
 import time
 import wave
 from dataclasses import dataclass, field
@@ -62,25 +60,6 @@ def iter_frames(pcm: np.ndarray, start_index: int) -> Iterator[Frame]:
     for offset in range(n_frames):
         start = offset * FRAME_SIZE
         yield Frame(index=start_index + offset, pcm=pcm[start : start + FRAME_SIZE])
-
-
-def extract_wake_token(headers: Any) -> str | None:
-    direct = headers.get("x-loona-wake-token")
-    if direct:
-        return direct
-
-    authorization = headers.get("authorization")
-    if authorization and authorization.lower().startswith("bearer "):
-        return authorization[7:].strip()
-    return None
-
-
-def is_valid_wake_token(provided: str | None, expected: str | None) -> bool:
-    if not expected:
-        return True
-    if not provided:
-        return False
-    return hmac.compare_digest(provided, expected)
 
 
 class ScoredVerifier:
@@ -229,7 +208,6 @@ class WakeDetector:
 
 class WakeRequestHandler(BaseHTTPRequestHandler):
     detector: WakeDetector
-    wake_api_token: str | None = None
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[wake] {self.address_string()} {fmt % args}")
@@ -248,10 +226,6 @@ class WakeRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path in {"/wake", "/wake/reset"} and not self._is_authorized():
-            self._json(HTTPStatus.UNAUTHORIZED, {"wake": False, "error": "unauthorized"})
-            return
-
         params = parse_qs(parsed.query)
         session_id = (
             params.get("session_id", [None])[0]
@@ -286,24 +260,14 @@ class WakeRequestHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header(
-            "Access-Control-Allow-Headers",
-            "authorization,content-type,x-loona-session-id,x-loona-wake-token",
-        )
-
-    def _is_authorized(self) -> bool:
-        return is_valid_wake_token(extract_wake_token(self.headers), self.wake_api_token)
+        self.send_header("Access-Control-Allow-Headers", "content-type,x-loona-session-id")
 
 
-def build_handler(
-    detector: WakeDetector,
-    wake_api_token: str | None = None,
-) -> type[WakeRequestHandler]:
+def build_handler(detector: WakeDetector) -> type[WakeRequestHandler]:
     class Handler(WakeRequestHandler):
         pass
 
     Handler.detector = detector
-    Handler.wake_api_token = wake_api_token
     return Handler
 
 
@@ -313,17 +277,12 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--model-dir", type=Path, default=Path(__file__).with_name("models"))
     parser.add_argument("--session-ttl-sec", type=int, default=DEFAULT_SESSION_TTL_SEC)
-    parser.add_argument("--wake-api-token", default=os.environ.get("WAKE_API_TOKEN"))
     args = parser.parse_args()
 
     detector = WakeDetector(args.model_dir, session_ttl_sec=args.session_ttl_sec)
-    server = ThreadingHTTPServer(
-        (args.host, args.port),
-        build_handler(detector, wake_api_token=args.wake_api_token or None),
-    )
+    server = ThreadingHTTPServer((args.host, args.port), build_handler(detector))
     print(f"Loona wake sidecar listening on http://{args.host}:{args.port}")
     print(f"Models: {args.model_dir}")
-    print(f"Wake API token required: {bool(args.wake_api_token)}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -332,3 +291,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

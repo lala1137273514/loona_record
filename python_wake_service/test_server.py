@@ -6,14 +6,7 @@ import wave
 
 import numpy as np
 
-from email.message import Message
-
-from python_wake_service.server import (
-    decode_wav_pcm16,
-    extract_wake_token,
-    is_valid_wake_token,
-    iter_frames,
-)
+from python_wake_service.server import decode_wav_pcm16, iter_frames
 
 
 def make_wav(samples: np.ndarray, sample_rate: int = 16000) -> bytes:
@@ -47,23 +40,7 @@ class ServerHelpersTest(unittest.TestCase):
         np.testing.assert_array_equal(frames[0].pcm, pcm[:160])
         np.testing.assert_array_equal(frames[1].pcm, pcm[160:320])
 
-    def test_token_auth_allows_unconfigured_service(self) -> None:
-        self.assertTrue(is_valid_wake_token(None, None))
-
-    def test_token_auth_requires_matching_token(self) -> None:
-        self.assertTrue(is_valid_wake_token("secret", "secret"))
-        self.assertFalse(is_valid_wake_token("wrong", "secret"))
-        self.assertFalse(is_valid_wake_token(None, "secret"))
-
-    def test_extract_wake_token_accepts_header_or_bearer(self) -> None:
-        headers = Message()
-        headers["x-loona-wake-token"] = "direct"
-        self.assertEqual(extract_wake_token(headers), "direct")
-
-        bearer_headers = Message()
-        bearer_headers["authorization"] = "Bearer from-auth"
-        self.assertEqual(extract_wake_token(bearer_headers), "from-auth")
-
 
 if __name__ == "__main__":
     unittest.main()
+
