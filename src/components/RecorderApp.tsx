@@ -1,45 +1,47 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { createStoragePath, DEFAULT_PROMPTS, type CaseLabel, type Prompt } from "@/lib/cases";
+import { createStoragePath, type CaseLabel } from "@/lib/cases";
 import { downsampleFloat32ToMono16k, encodePcm16Wav } from "@/lib/audio/wav";
+import { FINISH_STEPS, ORIGINAL_TEST_TASKS } from "@/lib/guide";
 import { normalizeUsername, shouldCreateNewUid } from "@/lib/identity";
 import { getBrowserSupabase } from "@/lib/supabase/client";
 
 const UID_KEY = "loona_record_uid";
 const USERNAME_KEY = "loona_record_username";
-const LABELS: CaseLabel[] = ["real_pos", "real_neg"];
 
-type RecorderStatus = {
-  kind: "idle" | "recording" | "ready" | "uploading" | "success" | "error";
-  message: string;
+type LabStatus = "idle" | "listening" | "saving" | "success" | "error";
+
+type LogLine = {
+  id: string;
+  className: "g" | "r" | "y";
+  text: string;
 };
 
 type SessionStats = {
   uploads: number;
-  failures: number;
-  latestPath: string;
+  real_pos: number;
+  real_neg: number;
 };
 
 export function RecorderApp() {
   const [uid, setUid] = useState("");
   const [username, setUsername] = useState("");
-  const [label, setLabel] = useState<CaseLabel>("real_pos");
-  const [prompt, setPrompt] = useState<Prompt>(DEFAULT_PROMPTS[0]);
-  const [status, setStatus] = useState<RecorderStatus>({
-    kind: "idle",
-    message: "输入名字后开始录制",
-  });
-  const [durationMs, setDurationMs] = useState(0);
+  const [status, setStatus] = useState<LabStatus>("idle");
+  const [statusText, setStatusText] = useState("照左侧清单念念看 —— 按 W/Q 会上传最近 4 秒");
+  const [done, setDone] = useState(() => ORIGINAL_TEST_TASKS.map(() => false));
+  const [activeTaskIndex, setActiveTaskIndex] = useState(0);
+  const [introOpen, setIntroOpen] = useState(true);
+  const [finishOpen, setFinishOpen] = useState(false);
+  const [micLevel, setMicLevel] = useState(0);
+  const [clock, setClock] = useState("0:00");
   const [previewUrl, setPreviewUrl] = useState("");
-  const [stats, setStats] = useState<SessionStats>({
-    uploads: 0,
-    failures: 0,
-    latestPath: "",
-  });
+  const [logs, setLogs] = useState<LogLine[]>([]);
+  const [stats, setStats] = useState<SessionStats>({ uploads: 0, real_pos: 0, real_neg: 0 });
 
-  const recorderRef = useRef<AudioRecorder | null>(null);
-  const wavRef = useRef<Uint8Array | null>(null);
+  const monitorRef = useRef<LiveAudioMonitor | null>(null);
+  const startedAtRef = useRef<number | null>(null);
+  const flashTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const existingUid = window.localStorage.getItem(UID_KEY);
@@ -47,7 +49,17 @@ export function RecorderApp() {
     window.localStorage.setItem(UID_KEY, nextUid);
     setUid(nextUid);
     setUsername(window.localStorage.getItem(USERNAME_KEY) ?? "");
-  }, []);
+
+    return () => {
+      monitorRef.current?.stop();
+      if (flashTimerRef.current) {
+        window.clearTimeout(flashTimerRef.current);
+      }
+      if (previewUrl) {
+        URL.revokeObjectURL(previewUrl);
+      }
+    };
+  }, [previewUrl]);
 
   useEffect(() => {
     if (username) {
@@ -56,90 +68,96 @@ export function RecorderApp() {
   }, [username]);
 
   useEffect(() => {
-    return () => {
-      if (previewUrl) {
-        URL.revokeObjectURL(previewUrl);
+    const timer = window.setInterval(() => {
+      if (!startedAtRef.current) {
+        setClock("0:00");
+        return;
       }
-      void recorderRef.current?.stop();
-    };
-  }, [previewUrl]);
+      const elapsed = Math.floor((Date.now() - startedAtRef.current) / 1000);
+      setClock(`${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
 
-  async function startRecording() {
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (!event.ctrlKey) {
+        return;
+      }
+      if (event.key === "w" || event.key === "W") {
+        event.preventDefault();
+        void saveCase("real_pos");
+      }
+      if (event.key === "q" || event.key === "Q") {
+        event.preventDefault();
+        void saveCase("real_neg");
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
+  async function startListening() {
+    const cleanName = normalizeUsername(username);
+    if (!cleanName || cleanName === "anonymous") {
+      setStatus("error");
+      setStatusText("先填名字，英文/拼音/昵称都可以");
+      return;
+    }
+
     try {
-      setStatus({ kind: "recording", message: "录音中，完成后点停止" });
-      setDurationMs(0);
-      wavRef.current = null;
-      if (previewUrl) {
-        URL.revokeObjectURL(previewUrl);
-        setPreviewUrl("");
-      }
-
-      const recorder = await createAudioRecorder();
-      recorderRef.current = recorder;
-      recorder.start();
+      setUsername(cleanName);
+      const monitor = await createLiveAudioMonitor((level) => setMicLevel(level));
+      monitorRef.current = monitor;
+      startedAtRef.current = Date.now();
+      setStatus("listening");
+      setStatusText("开始吧！照左侧清单念；漏识别按 Ctrl+W，误唤醒按 Ctrl+Q");
+      setIntroOpen(false);
+      addLog("y", "已开启麦克风，开始测试");
     } catch (error) {
-      setStatus({
-        kind: "error",
-        message: error instanceof Error ? error.message : "无法启动麦克风",
-      });
+      setStatus("error");
+      setStatusText(error instanceof Error ? error.message : "无法启动麦克风");
     }
   }
 
-  async function stopRecording() {
+  async function saveCase(label: CaseLabel) {
+    const monitor = monitorRef.current;
+    if (!monitor) {
+      setStatus("error");
+      setStatusText("先点「开始测试」开启麦克风");
+      return;
+    }
+
+    const captured = monitor.capture();
+    if (captured.samples.length < captured.sampleRate * captured.channelCount * 0.35) {
+      setStatus("error");
+      setStatusText("最近音频太短，先说一句再标记");
+      return;
+    }
+
+    const task = ORIGINAL_TEST_TASKS[activeTaskIndex] ?? ORIGINAL_TEST_TASKS[0];
+    const cleanName = normalizeUsername(username);
+    const caseId = crypto.randomUUID();
+    const createdAt = new Date();
+    const storagePath = createStoragePath({ label, uid, caseId, date: createdAt });
+
+    setStatus("saving");
+    setStatusText(label === "real_pos" ? "正在上传正样本" : "正在上传负样本");
+
     try {
-      const recorder = recorderRef.current;
-      if (!recorder) {
-        return;
-      }
-      const captured = await recorder.stop();
-      recorderRef.current = null;
       const pcm = downsampleFloat32ToMono16k(captured.samples, {
         inputSampleRate: captured.sampleRate,
         channelCount: captured.channelCount,
       });
       const wav = encodePcm16Wav(pcm, 16000);
-      const ms = Math.round((pcm.length / 16000) * 1000);
-      wavRef.current = wav;
-      setDurationMs(ms);
+      const durationMs = Math.round((pcm.length / 16000) * 1000);
       const blob = new Blob([toArrayBuffer(wav)], { type: "audio/wav" });
-      setPreviewUrl(URL.createObjectURL(blob));
-      setStatus({ kind: "ready", message: `已录制 ${Math.round(ms / 100) / 10}s，可试听或上传` });
-    } catch (error) {
-      setStatus({
-        kind: "error",
-        message: error instanceof Error ? error.message : "录音转换失败",
-      });
-    }
-  }
-
-  async function uploadCase() {
-    const wav = wavRef.current;
-    if (!wav) {
-      setStatus({ kind: "error", message: "请先录音" });
-      return;
-    }
-
-    const cleanName = normalizeUsername(username);
-    const caseId = crypto.randomUUID();
-    const createdAt = new Date();
-    const storagePath = createStoragePath({
-      label,
-      uid,
-      caseId,
-      date: createdAt,
-    });
-
-    setStatus({ kind: "uploading", message: "上传中" });
-    try {
       const supabase = getBrowserSupabase();
-      const blob = new Blob([toArrayBuffer(wav)], { type: "audio/wav" });
-      const { error: uploadError } = await supabase.storage
-        .from("loona-recordings")
-        .upload(storagePath, blob, {
-          contentType: "audio/wav",
-          upsert: false,
-        });
 
+      const { error: uploadError } = await supabase.storage.from("loona-recordings").upload(storagePath, blob, {
+        contentType: "audio/wav",
+        upsert: false,
+      });
       if (uploadError) {
         throw uploadError;
       }
@@ -149,8 +167,8 @@ export function RecorderApp() {
         uid,
         username: cleanName,
         label,
-        prompt_key: prompt.key,
-        prompt_text: prompt.text,
+        prompt_key: `task-${activeTaskIndex + 1}`,
+        prompt_text: `${task.text} ${task.note}`,
         storage_bucket: "loona-recordings",
         storage_path: storagePath,
         duration_ms: durationMs,
@@ -159,143 +177,181 @@ export function RecorderApp() {
         mime_type: "audio/wav",
         client_created_at: createdAt.toISOString(),
       });
-
       if (insertError) {
         throw insertError;
       }
 
-      setUsername(cleanName);
+      if (previewUrl) {
+        URL.revokeObjectURL(previewUrl);
+      }
+      setPreviewUrl(URL.createObjectURL(blob));
       setStats((current) => ({
         uploads: current.uploads + 1,
-        failures: current.failures,
-        latestPath: storagePath,
+        real_pos: current.real_pos + (label === "real_pos" ? 1 : 0),
+        real_neg: current.real_neg + (label === "real_neg" ? 1 : 0),
       }));
-      setStatus({ kind: "success", message: "上传完成" });
+      setStatus("success");
+      setStatusText(label === "real_pos" ? `已存正样本 #${stats.real_pos + 1}` : `已存负样本 #${stats.real_neg + 1}`);
+      addLog(label === "real_pos" ? "g" : "r", `${label === "real_pos" ? "漏识别→正样本" : "误唤醒→负样本"} (${durationMs}ms)`);
+      flashSuccess();
     } catch (error) {
-      setStats((current) => ({
-        ...current,
-        failures: current.failures + 1,
-      }));
-      setStatus({
-        kind: "error",
-        message: error instanceof Error ? error.message : "上传失败",
-      });
+      setStatus("error");
+      setStatusText(error instanceof Error ? error.message : "上传失败");
+      addLog("r", error instanceof Error ? error.message : "上传失败");
     }
+  }
+
+  function toggleTask(index: number) {
+    setActiveTaskIndex(index);
+    setDone((current) => {
+      const next = [...current];
+      next[index] = !next[index];
+      if (next.every(Boolean)) {
+        setFinishOpen(true);
+      }
+      return next;
+    });
+  }
+
+  function resetSessionView() {
+    setStats({ uploads: 0, real_pos: 0, real_neg: 0 });
+    setLogs([]);
+    setStatus("listening");
+    setStatusText("已清空本页计数；云端已上传数据不会删除");
   }
 
   function resetUid() {
     const nextUid = crypto.randomUUID();
     window.localStorage.setItem(UID_KEY, nextUid);
     setUid(nextUid);
-    setStatus({ kind: "idle", message: "已生成新的 uid" });
+    setStatusText("已生成新的 UID");
   }
 
-  const canRecord = uid && username.trim() && status.kind !== "recording" && status.kind !== "uploading";
-  const canUpload = wavRef.current && status.kind !== "recording" && status.kind !== "uploading";
+  function addLog(className: LogLine["className"], text: string) {
+    const time = new Date().toLocaleTimeString("en-GB");
+    setLogs((current) => [{ id: crypto.randomUUID(), className, text: `[${time}] ${text}` }, ...current].slice(0, 80));
+  }
+
+  function flashSuccess() {
+    if (flashTimerRef.current) {
+      window.clearTimeout(flashTimerRef.current);
+    }
+    flashTimerRef.current = window.setTimeout(() => {
+      setStatus((current) => (current === "success" ? "listening" : current));
+      setStatusText("照左侧清单念念看 —— 按 W/Q 会上传最近 4 秒");
+    }, 1600);
+  }
+
+  const doneCount = done.filter(Boolean).length;
+  const progress = `${(doneCount / ORIGINAL_TEST_TASKS.length) * 100}%`;
+  const appClassName = status === "success" ? "lab-app green" : "lab-app";
 
   return (
-    <main className="app-shell">
-      <section className="topbar">
-        <div>
-          <p className="eyebrow">Loona Record</p>
-          <h1>协同录制台</h1>
+    <>
+      <aside className="lab-guide">
+        <h3>测试清单(照着念)</h3>
+        <div className="lab-user">
+          <input
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+            placeholder="名字: 英文 / 拼音 / 昵称"
+          />
+          <button type="button" onClick={resetUid}>重置 UID</button>
         </div>
-        <div className={`status status-${status.kind}`}>{status.message}</div>
-      </section>
-
-      <section className="grid">
-        <div className="panel identity-panel">
-          <h2>采集者</h2>
-          <label className="field">
-            <span>用户名</span>
-            <input
-              value={username}
-              onChange={(event) => setUsername(event.target.value)}
-              placeholder="英文 / 拼音 / 昵称"
-            />
-          </label>
-          <div className="uid-row">
-            <code>{uid || "生成中"}</code>
-            <button className="secondary" type="button" onClick={resetUid}>
-              重置 UID
-            </button>
-          </div>
-        </div>
-
-        <div className="panel stats-panel">
-          <h2>本次会话</h2>
-          <div className="stats">
-            <span>
-              <strong>{stats.uploads}</strong>
-              上传
-            </span>
-            <span>
-              <strong>{stats.failures}</strong>
-              失败
-            </span>
-          </div>
-          <p className="muted breakable">{stats.latestPath || "暂无上传"}</p>
-        </div>
-      </section>
-
-      <section className="workspace">
-        <div className="panel prompt-panel">
-          <div className="section-head">
-            <h2>录制清单</h2>
-            <select
-              value={prompt.key}
-              onChange={(event) => {
-                const next = DEFAULT_PROMPTS.find((item) => item.key === event.target.value) ?? DEFAULT_PROMPTS[0];
-                setPrompt(next);
-                setLabel(next.recommendedLabel);
-              }}
+        <div className="lab-uid">{uid || "生成 UID 中"}</div>
+        <div className="lab-progress"><div style={{ width: progress }} /></div>
+        <div className="lab-tasks">
+          {ORIGINAL_TEST_TASKS.map((task, index) => (
+            <button
+              key={task.text}
+              type="button"
+              className={`lab-task${done[index] ? " done" : ""}${activeTaskIndex === index ? " active" : ""}`}
+              onClick={() => toggleTask(index)}
             >
-              {DEFAULT_PROMPTS.map((item) => (
-                <option key={item.key} value={item.key}>
-                  {item.text}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="prompt-display">
-            <p>{prompt.text}</p>
-            <span>{prompt.hint}</span>
-          </div>
-          <div className="segments" role="group" aria-label="case label">
-            {LABELS.map((item) => (
-              <button
-                key={item}
-                type="button"
-                className={label === item ? "active" : ""}
-                onClick={() => setLabel(item)}
-              >
-                {item}
-              </button>
-            ))}
-          </div>
+              {done[index] ? "✅ " : "⬜ "}
+              {task.text}
+              <span>{task.note}</span>
+            </button>
+          ))}
         </div>
+        <div className="lab-hint">
+          <b>每句之间停 2-3 秒</b><br />
+          说了 Loona 却没醒 → <kbd>Ctrl</kbd>+<kbd>W</kbd> 或点绿按钮<br />
+          误唤醒 → <kbd>Ctrl</kbd>+<kbd>Q</kbd> 或点黄按钮<br />
+          云端会记录你的 UID 和用户名，管理员可在 <a href="/admin">/admin</a> 导出 collected.zip
+        </div>
+        <button className="lab-finish" type="button" onClick={() => setFinishOpen(true)}>
+          我测完了，怎么发回？
+        </button>
+      </aside>
 
-        <div className="panel recorder-panel">
-          <div className="controls">
-            <button type="button" disabled={!canRecord} onClick={startRecording}>
-              录音
-            </button>
-            <button type="button" disabled={status.kind !== "recording"} onClick={stopRecording}>
-              停止
-            </button>
-            <button type="button" disabled={!canUpload} onClick={uploadCase}>
-              上传
-            </button>
-          </div>
-          {previewUrl ? (
-            <audio className="player" src={previewUrl} controls />
-          ) : (
-            <div className="empty-player">录完后可在这里试听</div>
-          )}
-          <p className="muted">每条建议 1-4 秒。浏览器会上传 16 kHz mono PCM16 WAV。</p>
+      <main className={appClassName}>
+        <div className="lab-big">{status === "success" ? "🟢 已上传" : status === "error" ? "⚠️ 出错" : "🔴 待命"}</div>
+        <div className="lab-meta">{statusText}</div>
+        <div className="lab-micwrap">
+          <div>麦克风音量(说话时应跳动；不动=浏览器没收到声音)</div>
+          <div className="lab-meter"><div style={{ width: `${Math.round(micLevel * 100)}%` }} /></div>
         </div>
-      </section>
-    </main>
+        <div className="lab-actions">
+          <span>
+            <button className="lab-btn lab-btn-w" type="button" disabled={status === "saving"} onClick={() => void saveCase("real_pos")}>
+              说了没醒(存正样本)
+            </button>
+            <em>或按 <kbd>Ctrl</kbd>+<kbd>W</kbd></em>
+          </span>
+          <span>
+            <button className="lab-btn lab-btn-q" type="button" disabled={status === "saving"} onClick={() => void saveCase("real_neg")}>
+              误唤醒(存负样本)
+            </button>
+            <em>或按 <kbd>Ctrl</kbd>+<kbd>Q</kbd></em>
+          </span>
+        </div>
+        <button className="lab-clear" type="button" onClick={resetSessionView}>清空本页计数重来</button>
+        {previewUrl ? <audio className="lab-player" src={previewUrl} controls /> : null}
+      </main>
+
+      <div className="lab-counts">
+        上传 <span>{stats.uploads}</span> · 正W <span>{stats.real_pos}</span> · 负Q <span>{stats.real_neg}</span><br />
+        <span>{clock}</span>
+      </div>
+      <div className="lab-log">
+        {logs.map((item) => <div key={item.id} className={item.className}>{item.text}</div>)}
+      </div>
+
+      {introOpen ? (
+        <div className="lab-modal">
+          <div className="lab-card">
+            <h2>Loona 唤醒测试 · 约 10 分钟</h2>
+            <label>
+              名字
+              <input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="英文 / 拼音 / 昵称" />
+            </label>
+            <ol>
+              <li>点下面按钮开始，同时开启麦克风</li>
+              <li>照左侧清单一步步念，每句之间停 2-3 秒</li>
+              <li>说了却没醒按 Ctrl+W；误唤醒按 Ctrl+Q</li>
+            </ol>
+            <button className="lab-go" type="button" onClick={() => void startListening()}>开始测试</button>
+          </div>
+        </div>
+      ) : null}
+
+      {finishOpen ? (
+        <div className="lab-modal">
+          <div className="lab-card">
+            <h2>测完啦</h2>
+            <div>你这次：上传 <b>{stats.uploads}</b> · 正样本 <b>{stats.real_pos}</b> · 负样本 <b>{stats.real_neg}</b></div>
+            <ol>
+              <li>云端已经收到，不需要压缩本地 collected</li>
+              <li>管理员打开 /admin，输入 token</li>
+              <li>点击导出 collected.zip</li>
+            </ol>
+            <div className="lab-local-note">{FINISH_STEPS.join(" / ")}</div>
+            <button className="lab-go" type="button" onClick={() => setFinishOpen(false)}>继续测</button>
+          </div>
+        </div>
+      ) : null}
+    </>
   );
 }
 
@@ -305,14 +361,18 @@ type CapturedAudio = {
   channelCount: number;
 };
 
-type AudioRecorder = {
-  start: () => void;
-  stop: () => Promise<CapturedAudio>;
+type LiveAudioMonitor = {
+  capture: () => CapturedAudio;
+  stop: () => void;
 };
 
-async function createAudioRecorder(): Promise<AudioRecorder> {
+async function createLiveAudioMonitor(onLevel: (level: number) => void): Promise<LiveAudioMonitor> {
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new Error("当前浏览器不支持麦克风录音");
+  }
+  const AudioCtor = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioCtor) {
+    throw new Error("当前浏览器不支持 AudioContext");
   }
 
   const stream = await navigator.mediaDevices.getUserMedia({
@@ -323,36 +383,40 @@ async function createAudioRecorder(): Promise<AudioRecorder> {
       autoGainControl: false,
     },
   });
-  const audioContext = new AudioContext();
+  const audioContext = new AudioCtor();
   const source = audioContext.createMediaStreamSource(stream);
-  const processor = audioContext.createScriptProcessor(4096, source.channelCount || 1, 1);
-  const chunks: Float32Array[] = [];
   const channelCount = source.channelCount || 1;
+  const processor = audioContext.createScriptProcessor(4096, channelCount, 1);
+  const chunks: Float32Array[] = [];
+  const maxSamples = Math.ceil(audioContext.sampleRate * channelCount * 4);
+  let totalSamples = 0;
 
   processor.onaudioprocess = (event) => {
     const input = event.inputBuffer;
     const frameCount = input.length;
     const interleaved = new Float32Array(frameCount * channelCount);
+    let energy = 0;
     for (let frame = 0; frame < frameCount; frame += 1) {
       for (let channel = 0; channel < channelCount; channel += 1) {
-        interleaved[frame * channelCount + channel] = input.getChannelData(channel)[frame] ?? 0;
+        const sample = input.getChannelData(channel)[frame] ?? 0;
+        interleaved[frame * channelCount + channel] = sample;
+        energy += sample * sample;
       }
     }
     chunks.push(interleaved);
+    totalSamples += interleaved.length;
+    while (totalSamples > maxSamples && chunks.length > 1) {
+      totalSamples -= chunks.shift()?.length ?? 0;
+    }
+    onLevel(Math.min(1, Math.sqrt(energy / interleaved.length) * 8));
   };
 
+  source.connect(processor);
+  processor.connect(audioContext.destination);
+
   return {
-    start() {
-      source.connect(processor);
-      processor.connect(audioContext.destination);
-    },
-    async stop() {
-      source.disconnect();
-      processor.disconnect();
-      stream.getTracks().forEach((track) => track.stop());
-      await audioContext.close();
-      const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-      const samples = new Float32Array(totalLength);
+    capture() {
+      const samples = new Float32Array(totalSamples);
       let offset = 0;
       for (const chunk of chunks) {
         samples.set(chunk, offset);
@@ -363,6 +427,12 @@ async function createAudioRecorder(): Promise<AudioRecorder> {
         sampleRate: audioContext.sampleRate,
         channelCount,
       };
+    },
+    stop() {
+      source.disconnect();
+      processor.disconnect();
+      stream.getTracks().forEach((track) => track.stop());
+      void audioContext.close();
     },
   };
 }
