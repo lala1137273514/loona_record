@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: loona-wake-detector
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: WAKE_API_TOKEN
+        generateValue: true
+
