@@ -16,7 +16,7 @@ import {
 const UID_KEY = "loona_record_uid";
 const USERNAME_KEY = "loona_record_username";
 const WAKE_POLL_INTERVAL_MS = 320;
-const WAKE_FLASH_MS = 2200;
+const WAKE_FLASH_MS = 5000;
 
 type LogLine = {
   id: string;
@@ -53,6 +53,7 @@ export function RecorderApp() {
   const wakeSessionIdRef = useRef("");
   const wakeDetectorDisabledRef = useRef(false);
   const lastWakeAtRef = useRef(0);
+  const wakeAudioContextRef = useRef<AudioContext | null>(null);
 
   useEffect(() => {
     const existingUid = window.localStorage.getItem(UID_KEY);
@@ -68,6 +69,9 @@ export function RecorderApp() {
       }
       if (wakeFlashTimerRef.current) {
         window.clearTimeout(wakeFlashTimerRef.current);
+      }
+      if (wakeAudioContextRef.current) {
+        void wakeAudioContextRef.current.close();
       }
       stopWakePolling();
     };
@@ -217,6 +221,7 @@ export function RecorderApp() {
     setStatus("wake_detected");
     setStatusText(detail);
     addLog("g", `🟢 唤醒 ${detail}`);
+    playWakeTone();
 
     if (wakeFlashTimerRef.current) {
       window.clearTimeout(wakeFlashTimerRef.current);
@@ -225,6 +230,29 @@ export function RecorderApp() {
       setStatus((current) => (current === "wake_detected" ? "listening" : current));
       setStatusText("照左侧清单念念看 —— 变绿就是识别到了");
     }, WAKE_FLASH_MS);
+  }
+
+  function playWakeTone() {
+    try {
+      const AudioCtor = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtor) {
+        return;
+      }
+      const audioContext = wakeAudioContextRef.current ?? new AudioCtor();
+      wakeAudioContextRef.current = audioContext;
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      oscillator.connect(gain);
+      gain.connect(audioContext.destination);
+      oscillator.frequency.value = 880;
+      gain.gain.setValueAtTime(0.001, audioContext.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.28, audioContext.currentTime + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.28);
+      oscillator.start();
+      oscillator.stop(audioContext.currentTime + 0.3);
+    } catch {
+      // Audio feedback is best-effort; visual wake state is the source of truth.
+    }
   }
 
   async function saveCase(label: CaseLabel) {

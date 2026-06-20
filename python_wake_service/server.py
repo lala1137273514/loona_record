@@ -177,6 +177,13 @@ class WakeDetector:
         }
         if events:
             response.update(events[-1])
+        print(
+            "[wake-debug] "
+            f"session={session_id} checked_ms={response['checked_ms']} "
+            f"kws_score={latest_kws_score:.4f} wake={response['wake']} "
+            f"events={len(events)}",
+            flush=True,
+        )
         return response
 
     def _get_session(self, session_id: str) -> DetectorSession:
